@@ -7,6 +7,7 @@ A high-performance TTS API server providing OpenAI-compatible endpoints
 for the Qwen3-TTS model.
 """
 
+import asyncio
 import logging
 import os
 import sys
@@ -40,6 +41,12 @@ WORKERS = int(os.getenv("WORKERS", "1"))
 # Backend configuration
 TTS_BACKEND = os.getenv("TTS_BACKEND", "official")
 TTS_WARMUP_ON_START = os.getenv("TTS_WARMUP_ON_START", "false").lower() == "true"
+
+# GPU keepalive: periodic matmul prevents AMD DPM from downclocking the GPU
+# after an idle period (which would otherwise spike TTFB from ~0.3 s to ~0.85 s).
+# Set GPU_KEEPALIVE_INTERVAL to a positive integer (seconds) to enable.
+# Recommended: 15 s for AMD ROCm; harmless on NVIDIA.  Default 0 = disabled.
+GPU_KEEPALIVE_INTERVAL = int(os.getenv("GPU_KEEPALIVE_INTERVAL", "0"))
 
 # CORS configuration
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
@@ -99,10 +106,42 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Backend initialization delayed: {e}")
         logger.info("Backend will be loaded on first request.")
-    
+
+    # GPU keepalive: periodic small matmul prevents AMD DPM from downclocking the GPU
+    # after idle, keeping TTFB consistently low (~0.3 s instead of ~0.85 s after idle).
+    # Enable with GPU_KEEPALIVE_INTERVAL=15 (seconds). Harmless on NVIDIA.
+    keepalive_task = None
+    if GPU_KEEPALIVE_INTERVAL > 0:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                # Use the backend's device if it's loaded; otherwise fall back to cuda:0.
+                try:
+                    from .backends import get_backend as _get_backend
+                    _be = _get_backend()
+                    _ka_device = str(_be.device) if hasattr(_be, "device") and _be.device else "cuda:0"
+                except Exception:
+                    _ka_device = "cuda:0"
+                _ka_tensor = torch.randn(512, 512, device=_ka_device)
+
+                async def _gpu_keepalive():
+                    while True:
+                        await asyncio.sleep(GPU_KEEPALIVE_INTERVAL)
+                        torch.matmul(_ka_tensor, _ka_tensor)
+
+                keepalive_task = asyncio.create_task(_gpu_keepalive())
+                logger.info(
+                    f"GPU keepalive enabled: matmul every {GPU_KEEPALIVE_INTERVAL}s "
+                    f"on {_ka_device}"
+                )
+        except Exception as exc:
+            logger.warning(f"GPU keepalive setup failed: {exc}")
+
     yield
-    
+
     # Cleanup
+    if keepalive_task:
+        keepalive_task.cancel()
     logger.info("Server shutting down...")
 
 

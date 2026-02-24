@@ -8,9 +8,11 @@ Implements endpoints compatible with OpenAI's TTS API specification.
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -38,6 +40,16 @@ except ValueError:
     logger.warning("Invalid TTS_MAX_CONCURRENT value; falling back to 1")
     _MAX_CONCURRENT = 1
 _generation_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+
+# Voice library: saved voice profiles used via the "clone:ProfileName" voice prefix.
+# Configurable via VOICE_LIBRARY_DIR env var; defaults to ./voice_library.
+VOICE_LIBRARY_DIR = Path(
+    os.environ.get("VOICE_LIBRARY_DIR", "./voice_library")
+).resolve()
+
+# In-process cache for reference audio reads (profile_name -> (audio_np, sample_rate)).
+# Avoids re-reading and re-decoding the same WAV file on every request.
+_ref_audio_cache: dict = {}
 
 router = APIRouter(
     tags=["OpenAI Compatible TTS"],
@@ -143,6 +155,55 @@ def extract_language_from_model(model_name: str) -> Optional[str]:
     return None
 
 
+def _load_voice_profile(name_or_id: str) -> dict:
+    """Load a voice profile by name or profile_id from the voice library.
+
+    Searches ``VOICE_LIBRARY_DIR/profiles/`` for a sub-directory whose
+    ``meta.json`` matches the given *name_or_id* (case-insensitive name match
+    or exact profile_id match).
+
+    Returns a dict with keys:
+        ref_audio_path, ref_text, x_vector_only_mode, language, name
+
+    Raises:
+        ValueError: if the profile is not found or its reference audio is missing.
+    """
+    profiles_dir = VOICE_LIBRARY_DIR / "profiles"
+    if not profiles_dir.exists():
+        raise ValueError(f"Voice library not found: {profiles_dir}")
+
+    for child in sorted(profiles_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        meta_file = child / "meta.json"
+        if not meta_file.exists():
+            continue
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        if (
+            meta.get("profile_id") == name_or_id
+            or meta.get("name", "").lower() == name_or_id.lower()
+        ):
+            ref_filename = meta.get("ref_audio_filename", "")
+            if not ref_filename:
+                raise ValueError(f"Profile '{name_or_id}' has no reference audio filename")
+            ref_path = child / ref_filename
+            if not ref_path.exists():
+                raise ValueError(f"Reference audio missing: {ref_path}")
+            return {
+                "ref_audio_path": str(ref_path),
+                "ref_text": meta.get("ref_text", ""),
+                "x_vector_only_mode": meta.get("x_vector_only_mode", False),
+                "language": meta.get("language", "Auto"),
+                "name": meta.get("name", name_or_id),
+            }
+
+    raise ValueError(f"Voice profile not found: '{name_or_id}'")
+
+
 async def get_tts_backend():
     """Get the TTS backend instance, initializing if needed."""
     from ..backends import get_backend, initialize_backend
@@ -226,8 +287,17 @@ async def create_speech(
 ):
     """
     OpenAI-compatible endpoint for text-to-speech.
-    
+
     Generates audio from the input text using the specified voice and model.
+
+    **Voice library:** pass ``voice: "clone:ProfileName"`` to use a saved voice
+    profile from the voice library (``VOICE_LIBRARY_DIR/profiles/``).  The
+    server automatically switches to the Base model for profile-based cloning.
+
+    **Real-time streaming:** set ``stream: true`` together with
+    ``response_format: "pcm"`` to receive raw PCM chunks as the model generates
+    audio (requires the *optimized* backend; other backends fall back to chunked
+    delivery of fully-generated audio).
     """
     # Validate model
     if request.model not in MODEL_MAPPING:
@@ -258,6 +328,206 @@ async def create_speech(
         model_language = extract_language_from_model(request.model)
         language = model_language if model_language else (request.language or "Auto")
 
+        # ----------------------------------------------------------------
+        # Voice library: "clone:ProfileName" -> load profile + voice clone
+        # ----------------------------------------------------------------
+        if request.voice.lower().startswith("clone:"):
+            profile_name = request.voice[len("clone:"):].strip()
+            if not profile_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "invalid_voice",
+                        "message": (
+                            "The 'clone:' prefix requires a profile name, "
+                            "e.g. voice='clone:MyVoice'"
+                        ),
+                        "type": "invalid_request_error",
+                    },
+                )
+            try:
+                profile = _load_voice_profile(profile_name)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "error": "profile_not_found",
+                        "message": str(exc),
+                        "type": "invalid_request_error",
+                    },
+                )
+
+            backend = await get_tts_backend()
+
+            # Cache reference audio reads to avoid repeated disk I/O
+            ref_audio_path = profile["ref_audio_path"]
+            if profile_name not in _ref_audio_cache:
+                ref_audio_np, ref_sr = sf.read(ref_audio_path)
+                if len(ref_audio_np.shape) > 1:
+                    ref_audio_np = ref_audio_np.mean(axis=1)
+                ref_audio_np = ref_audio_np.astype(np.float32)
+                _ref_audio_cache[profile_name] = (ref_audio_np, ref_sr)
+                logger.info(f"Reference audio cached for profile '{profile_name}'")
+            ref_audio_np, ref_sr = _ref_audio_cache[profile_name]
+
+            clone_lang = (
+                language if language != "Auto" else profile["language"]
+            )
+            logger.info(
+                f"Voice library clone '{profile['name']}': "
+                f"lang={clone_lang}, "
+                f"x_vector_only={profile['x_vector_only_mode']}, "
+                f"stream={request.stream}"
+            )
+
+            if request.stream and hasattr(backend, "generate_voice_clone_streaming"):
+                # Real-time streaming path
+                fmt = request.response_format
+                if fmt == "wav":
+                    fmt = "pcm"
+                content_type = get_content_type(fmt)
+
+                async def _clone_stream():
+                    gen_start = time.time()
+                    first_chunk_logged = False
+                    total_samples = 0
+                    chunk_count = 0
+                    sample_rate = 24000
+                    async for pcm_chunk, sr in backend.generate_voice_clone_streaming(
+                        text=normalized_text,
+                        ref_audio=ref_audio_np,
+                        ref_audio_sr=ref_sr,
+                        ref_text=profile["ref_text"] or None,
+                        language=clone_lang,
+                        x_vector_only_mode=profile["x_vector_only_mode"],
+                        cache_key=profile_name,
+                    ):
+                        if pcm_chunk is not None and len(pcm_chunk) > 0:
+                            if not first_chunk_logged:
+                                logger.info(
+                                    f"Voice clone stream TTFB: "
+                                    f"{time.time()-gen_start:.3f}s"
+                                )
+                                first_chunk_logged = True
+                            total_samples += len(pcm_chunk)
+                            sample_rate = sr
+                            chunk_count += 1
+                            yield encode_audio(pcm_chunk, fmt, sr)
+                            await asyncio.sleep(0)
+                    gen_time = time.time() - gen_start
+                    audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
+                    rtf = gen_time / audio_dur if audio_dur > 0 else 0
+                    logger.info(
+                        f"Voice clone stream done: "
+                        f"total={gen_time:.2f}s audio={audio_dur:.2f}s "
+                        f"RTF={rtf:.2f}x chunks={chunk_count}"
+                    )
+
+                return StreamingResponse(
+                    _clone_stream(),
+                    media_type=content_type,
+                    headers={
+                        "Content-Disposition": f"inline; filename=speech.{fmt}",
+                        "Cache-Control": "no-cache",
+                    },
+                )
+            else:
+                # Non-streaming path
+                gen_start = time.time()
+                audio, sample_rate = await backend.generate_voice_clone(
+                    text=normalized_text,
+                    ref_audio=ref_audio_np,
+                    ref_audio_sr=ref_sr,
+                    ref_text=profile["ref_text"] or None,
+                    language=clone_lang,
+                    x_vector_only_mode=profile["x_vector_only_mode"],
+                    speed=request.speed,
+                    cache_key=profile_name,
+                )
+                gen_time = time.time() - gen_start
+                audio_dur = len(audio) / sample_rate if sample_rate > 0 else 0
+                rtf = gen_time / audio_dur if audio_dur > 0 else 0
+                logger.info(
+                    f"Voice clone done: gen={gen_time:.2f}s "
+                    f"audio={audio_dur:.2f}s RTF={rtf:.2f}x"
+                )
+
+                fmt = request.response_format
+                if fmt == "wav":
+                    fmt = "mp3"
+                audio_bytes = encode_audio(audio, fmt, sample_rate)
+                content_type = get_content_type(fmt)
+
+                async def _send_clone():
+                    for i in range(0, len(audio_bytes), 4096):
+                        yield audio_bytes[i:i + 4096]
+
+                return StreamingResponse(
+                    _send_clone(),
+                    media_type=content_type,
+                    headers={
+                        "Content-Disposition": f"inline; filename=speech.{fmt}",
+                        "Cache-Control": "no-cache",
+                    },
+                )
+
+        # ----------------------------------------------------------------
+        # Real-time streaming for built-in voices (optimized backend only)
+        # ----------------------------------------------------------------
+        if request.stream:
+            backend = await get_tts_backend()
+            if hasattr(backend, "generate_speech_streaming"):
+                voice_name = get_voice_name(request.voice)
+                fmt = request.response_format
+                if fmt == "wav":
+                    fmt = "pcm"
+                content_type = get_content_type(fmt)
+
+                async def _speech_stream():
+                    gen_start = time.time()
+                    first_chunk_logged = False
+                    total_samples = 0
+                    chunk_count = 0
+                    sample_rate = 24000
+                    async for pcm_chunk, sr in backend.generate_speech_streaming(
+                        text=normalized_text,
+                        voice=voice_name,
+                        language=language,
+                        instruct=request.instruct,
+                        model=request.model,
+                    ):
+                        if pcm_chunk is not None and len(pcm_chunk) > 0:
+                            if not first_chunk_logged:
+                                logger.info(
+                                    f"TTS stream TTFB: "
+                                    f"{time.time()-gen_start:.3f}s"
+                                )
+                                first_chunk_logged = True
+                            total_samples += len(pcm_chunk)
+                            sample_rate = sr
+                            chunk_count += 1
+                            yield encode_audio(pcm_chunk, fmt, sr)
+                            await asyncio.sleep(0)
+                    gen_time = time.time() - gen_start
+                    audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
+                    rtf = gen_time / audio_dur if audio_dur > 0 else 0
+                    logger.info(
+                        f"TTS stream done: total={gen_time:.2f}s "
+                        f"audio={audio_dur:.2f}s RTF={rtf:.2f}x chunks={chunk_count}"
+                    )
+
+                return StreamingResponse(
+                    _speech_stream(),
+                    media_type=content_type,
+                    headers={
+                        "Content-Disposition": f"attachment; filename=speech.{fmt}",
+                        "Cache-Control": "no-cache",
+                    },
+                )
+
+        # ----------------------------------------------------------------
+        # Non-streaming (or streaming fallback for non-optimized backends)
+        # ----------------------------------------------------------------
         # Guard against concurrent overload
         async with _generation_semaphore:
             # Generate speech
@@ -273,10 +543,12 @@ async def create_speech(
         content_type = get_content_type(request.response_format)
 
         if request.stream:
-            # Stream encoded audio in chunks.
+            # Fallback streaming: generate fully then chunk (non-optimized backends)
             async def _pcm_chunks():
                 chunk_size = 4096
-                audio_bytes = await asyncio.to_thread(encode_audio, audio, request.response_format, sample_rate)
+                audio_bytes = await asyncio.to_thread(
+                    encode_audio, audio, request.response_format, sample_rate
+                )
                 for i in range(0, len(audio_bytes), chunk_size):
                     yield audio_bytes[i:i + chunk_size]
 
@@ -344,7 +616,11 @@ async def get_model(model_id: str):
 @router.get("/audio/voices")
 @router.get("/voices")
 async def list_voices():
-    """List all available voices for text-to-speech."""
+    """List all available voices for text-to-speech.
+
+    Includes built-in Qwen3-TTS speakers, OpenAI-compatible aliases, and any
+    saved voice profiles from the voice library (listed with a ``clone:`` prefix).
+    """
     # Default voices (always available)
     default_voices = [
         VoiceInfo(id="Vivian", name="Vivian", language="English", description="Female voice"),
@@ -366,7 +642,29 @@ async def list_voices():
     ]
     
     default_languages = ["English", "Chinese", "Japanese", "Korean", "German", "French", "Spanish", "Russian", "Portuguese", "Italian"]
-    
+
+    # Discover voice library profiles (clone: prefix voices)
+    clone_voices: List[dict] = []
+    profiles_dir = VOICE_LIBRARY_DIR / "profiles"
+    if profiles_dir.exists():
+        for child in sorted(profiles_dir.iterdir()):
+            meta_file = child / "meta.json"
+            if not meta_file.exists():
+                continue
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                if meta.get("ref_audio_filename"):
+                    clone_id = f"clone:{meta['name']}"
+                    clone_voices.append(
+                        VoiceInfo(
+                            id=clone_id,
+                            name=clone_id,
+                            description=f"Voice library profile: {meta['name']}",
+                        ).model_dump()
+                    )
+            except Exception:
+                pass
+
     try:
         backend = await get_tts_backend()
         
@@ -380,7 +678,7 @@ async def list_voices():
         if speakers:
             voices = []
             for speaker in speakers:
-                if backend.is_custom_voice(speaker):
+                if hasattr(backend, "is_custom_voice") and backend.is_custom_voice(speaker):
                     description = f"Custom cloned voice: {speaker}"
                 else:
                     description = f"Qwen3-TTS voice: {speaker}"
@@ -399,7 +697,7 @@ async def list_voices():
             voices += [v.model_dump() for v in openai_voices]
 
         return {
-            "voices": voices,
+            "voices": voices + clone_voices,
             "languages": languages if languages else default_languages,
         }
         
@@ -407,7 +705,11 @@ async def list_voices():
         logger.warning(f"Could not get voices from backend: {e}")
         # Return default voices if backend is not loaded
         return {
-            "voices": [v.model_dump() for v in default_voices] + [v.model_dump() for v in openai_voices],
+            "voices": (
+                [v.model_dump() for v in default_voices]
+                + [v.model_dump() for v in openai_voices]
+                + clone_voices
+            ),
             "languages": default_languages,
         }
 

@@ -60,7 +60,13 @@ def get_backend() -> TTSBackend:
     
     logger.info(f"Initializing TTS backend: {backend_type}")
     
-    if backend_type == "official":
+    if backend_type == "optimized":
+        # Optimized backend: torch.compile, CUDA graphs, model switching, streaming
+        from .optimized_backend import OptimizedQwen3TTSBackend
+        _backend_instance = OptimizedQwen3TTSBackend()
+        logger.info("Using optimized Qwen3-TTS backend")
+
+    elif backend_type == "official":
         # Official backend (GPU/CPU auto-detect)
         if model_name:
             _backend_instance = OfficialQwen3TTSBackend(model_name=model_name)
@@ -121,7 +127,7 @@ def get_backend() -> TTSBackend:
         logger.error(f"Unknown backend type: {backend_type}")
         raise ValueError(
             f"Unknown TTS_BACKEND: {backend_type}. "
-            f"Supported values: 'official', 'vllm_omni', 'pytorch', 'openvino'"
+            f"Supported values: 'optimized', 'official', 'vllm_omni', 'pytorch', 'openvino'"
         )
     
     return _backend_instance

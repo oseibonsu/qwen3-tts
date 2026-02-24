@@ -1009,6 +1009,102 @@ class Qwen3TTSModel:
         return wavs, fs
 
 
+    # custom voice model — streaming (patch: not in upstream dffdeeq)
+    @torch.no_grad()
+    def stream_generate_custom_voice(
+        self,
+        text: str,
+        speaker: str,
+        language: str = None,
+        instruct: Optional[str] = None,
+        non_streaming_mode: bool = False,
+        emit_every_frames: int = 8,
+        decode_window_frames: int = 80,
+        overlap_samples: int = 0,
+        max_frames: int = 10000,
+        use_optimized_decode: bool = True,
+        **kwargs,
+    ) -> "Generator[Tuple[np.ndarray, int], None, None]":
+        """
+        Stream custom voice speech generation, yielding PCM chunks as they are generated.
+
+        Modeled after stream_generate_voice_clone() but works with the CustomVoice model
+        (predefined speakers instead of reference audio).
+
+        NOTE: This method is not in upstream dffdeeq/Qwen3-TTS-streaming — it is our patch.
+        NOTE: Only supports single-sample generation (no batching).
+
+        Args:
+            text: Text to synthesize (single string only, no batch).
+            speaker: Speaker name (must match a supported speaker for the loaded model).
+            language: Language name (e.g. "English", "German"). Defaults to "Auto".
+            instruct: Optional instruction for voice style/emotion (1.7B model only).
+            non_streaming_mode: If True, passes non-streaming flag to underlying model.
+            emit_every_frames: Emit a PCM chunk every N decoded frames (lower = lower TTFB).
+            decode_window_frames: Window size for streaming decode (must match what was
+                                  passed to enable_streaming_optimizations if used).
+            overlap_samples: Overlap between consecutive chunks (default 0 = no overlap).
+            max_frames: Safety cap on total frames (default 10 000).
+            use_optimized_decode: Use the optimized streaming decoder path (default True).
+
+        Yields:
+            Tuple[np.ndarray, int]: (pcm_chunk as float32, sample_rate)
+
+        Raises:
+            ValueError: If the loaded model is not a CustomVoice model, or if text is a list.
+        """
+        if self.model.tts_model_type != "custom_voice":
+            raise ValueError(
+                f"model with tts_model_type={self.model.tts_model_type} "
+                "does not support stream_generate_custom_voice"
+            )
+
+        if isinstance(text, list):
+            raise ValueError("stream_generate_custom_voice only supports single text, not batch")
+
+        texts = [text]
+        languages = [language if language is not None else "Auto"]
+        speakers = [speaker]
+
+        self._validate_languages(languages)
+        self._validate_speakers(speakers)
+
+        if self.model.tts_model_size in "0b6":
+            instruct = None
+        instructs = [instruct if instruct is not None else ""]
+
+        input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
+
+        instruct_ids: List[Optional[torch.Tensor]] = []
+        for ins in instructs:
+            if ins is None or ins == "":
+                instruct_ids.append(None)
+            else:
+                instruct_ids.append(self._tokenize_texts([self._build_instruct_text(ins)])[0])
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        supported_params = {
+            "do_sample", "top_k", "top_p", "temperature",
+            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature"
+        }
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
+
+        for chunk, sr in self.model.stream_generate_pcm(
+            input_ids=input_ids,
+            instruct_ids=instruct_ids,
+            speakers=speakers,
+            languages=languages,
+            non_streaming_mode=non_streaming_mode,
+            emit_every_frames=emit_every_frames,
+            decode_window_frames=decode_window_frames,
+            overlap_samples=overlap_samples,
+            max_frames=max_frames,
+            use_optimized_decode=use_optimized_decode,
+            **gen_kwargs,
+        ):
+            yield chunk, sr
+
+
     def get_supported_speakers(self) -> Optional[List[str]]:
         """
         List supported speaker names for the current model.
