@@ -21,7 +21,7 @@ This repository provides an **OpenAI-compatible FastAPI server** for **Qwen3-TTS
 ## ✨ Features
 
 - 🎯 **OpenAI API Compatible** - Drop-in replacement for `POST /v1/audio/speech`
-- ⚡ **Multiple Backends** - Choose between official or vLLM-Omni backend for optimal performance
+- ⚡ **Multiple Backends** - Choose between official, optimized, or vLLM-Omni backend for optimal performance
 - 🌐 **Multi-language Support** - 10+ languages (Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian)
 - 🎨 **Multiple Voice Options** - 9 premium voices with various gender, age, and dialect combinations
 - 📊 **Multiple Audio Formats** - MP3, Opus, AAC, FLAC, WAV, PCM
@@ -30,6 +30,10 @@ This repository provides an **OpenAI-compatible FastAPI server** for **Qwen3-TTS
 - 🐳 **Docker Ready** - Multi-stage Dockerfile with GPU and CPU variants
 - 🖥️ **Web Interface** - Dark-themed interactive demo UI
 - 🎙️ **Voice Studio** - Comprehensive UI for creating, managing, and exporting voice profiles
+- 🔄 **Real-Time Streaming** - True token-by-token PCM streaming (optimized backend)
+- 🗂️ **Voice Library** - Persistent saved-voice profiles via `clone:ProfileName` voice prefix
+- 🏎️ **torch.compile + CUDA Graphs** - Optional compiled inference with warmup (optimized backend)
+- 🔁 **Voice Prompt Caching** - Cached speaker embeddings for repeat voice-clone requests
 
 ### Backend Options
 
@@ -37,11 +41,13 @@ This implementation supports multiple backend engines:
 
 | Backend | Speed | Setup | Best For | Status |
 |---------|-------|-------|----------|--------|
+| **Optimized** | ⚡⚡⚡ Best | ⚠️ config.yaml | Streaming, voice library, production GPU | ✅ Stable |
 | **Official** (default) | ⚡⚡ Excellent | ✅ Simple | All use cases, production-ready | ✅ Stable |
 | **vLLM-Omni** | ⚡⚡⚡ Fast | ⚠️ Python 3.12 + CUDA | High-throughput, low-latency | ✅ Available |
 | **PyTorch CPU** | ⚡ Good | ✅ Simple | CPU-only systems (i5-1240P, etc.) | ✅ Stable |
 | **OpenVINO** | ⚡⚡ Better* | ⚠️ Complex | Intel CPU/NPU (experimental) | ⚠️ Experimental |
 
+- **Optimized Backend** (`TTS_BACKEND=optimized`): Dynamic model switching, real-time PCM streaming, torch.compile/CUDA graphs, voice prompt caching, and voice library support. Reads model config from `~/qwen3-tts/config.yaml`. **Recommended for high-throughput production deployments and voice agents.**
 - **Official Backend**: Uses the official Qwen3-TTS Python implementation with GPU/CPU auto-detect. **Recommended for most users.**
 - **vLLM-Omni Backend**: Uses [vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/) for optimized inference. Requires Python 3.12 and a dedicated Docker image. See [VLLM_BACKEND_STATUS.md](VLLM_BACKEND_STATUS.md) for details.
 - **PyTorch CPU Backend**: CPU-optimized PyTorch with threading tuning and optional IPEX support. **Recommended for CPU-only systems.** See [CPU_BACKEND_GUIDE.md](CPU_BACKEND_GUIDE.md) for details.
@@ -213,6 +219,108 @@ qwen-tts-voice-studio
 
 The Voice Studio will automatically connect to your running Qwen3-TTS API server to generate audio. Make sure the API server is running before using the Voice Studio.
 
+## ⚡ Optimized Backend
+
+The `optimized` backend (`TTS_BACKEND=optimized`) delivers the best performance for GPU deployments:
+
+- **Real-time streaming** — true token-by-token PCM chunks via `stream_generate_custom_voice` / `stream_generate_voice_clone`, not post-generation chunking.
+- **torch.compile + CUDA graphs** — compiled decoder with captured CUDA graphs; configurable compile mode (`max-autotune` recommended for production).
+- **Voice prompt caching** — the speaker embedding for each voice-library profile is built once and reused, saving ~0.7 s per repeated clone request.
+- **Dynamic model switching** — automatically switches between CustomVoice and Base models within the same server process (no restart needed).
+- **GPU keepalive** — optional periodic matmul (`GPU_KEEPALIVE_INTERVAL=15`) prevents AMD DPM idle downclocking that would otherwise spike TTFB.
+
+### Setup
+
+1. Copy `config.yaml` to `~/qwen3-tts/config.yaml` (or set `TTS_CONFIG` env var):
+   ```bash
+   cp config.yaml ~/qwen3-tts/config.yaml
+   ```
+
+2. Edit `config.yaml` to point to your local model paths:
+   ```yaml
+   default_model: 0.6B-CustomVoice
+   models:
+     0.6B-CustomVoice:
+       hf_id: /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice
+       type: customvoice
+   ```
+
+3. Start the server:
+   ```bash
+   TTS_BACKEND=optimized python -m api.main
+   ```
+
+### Real-time streaming example
+
+```python
+import httpx, sounddevice as sd, numpy as np
+
+with httpx.stream("POST", "http://localhost:8880/v1/audio/speech",
+                  json={"input": "Hello world!", "voice": "Vivian",
+                        "model": "tts-1", "stream": True,
+                        "response_format": "pcm"}) as r:
+    audio = np.frombuffer(b"".join(r.iter_bytes()), dtype=np.float32)
+    sd.play(audio, 24000)
+    sd.wait()
+```
+
+## 🗂️ Voice Library
+
+Save voice profiles to disk and reuse them with the `clone:ProfileName` prefix.
+The server loads the reference audio once, caches the speaker embedding,
+and automatically switches to the Base model for cloning.
+
+### Directory layout
+
+```
+$VOICE_LIBRARY_DIR/profiles/
+└── alice/
+    ├── meta.json           # profile metadata
+    └── reference.wav       # reference audio (5–20 s, clean speech)
+```
+
+### meta.json
+
+```json
+{
+    "name": "Alice",
+    "profile_id": "alice",
+    "ref_audio_filename": "reference.wav",
+    "ref_text": "Optional transcript of the reference audio.",
+    "x_vector_only_mode": false,
+    "language": "English"
+}
+```
+
+### Usage
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8880/v1", api_key="not-needed")
+
+# Non-streaming
+response = client.audio.speech.create(
+    model="tts-1",
+    voice="clone:Alice",
+    input="This is Alice speaking.",
+)
+response.stream_to_file("alice.mp3")
+
+# Real-time streaming (optimized backend)
+with client.audio.speech.with_streaming_response.create(
+    model="tts-1",
+    voice="clone:Alice",
+    input="This is Alice speaking with streaming.",
+    extra_body={"stream": True, "response_format": "pcm"},
+) as r:
+    r.stream_to_file("alice.pcm")
+```
+
+Profiles also appear in the `/v1/voices` endpoint response with a `clone:` prefix.
+
+See [docs/voice-library.md](docs/voice-library.md) for full documentation.
+
 ## 📦 Deployment
 
 ### Option 1: Using Conda (Recommended for Development)
@@ -241,12 +349,14 @@ The server will start on `http://0.0.0.0:8880` by default.
 - `PORT` - Server port (default: `8880`)
 - `WORKERS` - Number of workers (default: `1`)
 - `CORS_ORIGINS` - CORS origins (default: `*`)
-- `TTS_BACKEND` - Backend engine: `official` or `vllm_omni` (default: `official`)
-- `TTS_MODEL_NAME` - Override default model (optional)
+- `TTS_BACKEND` - Backend engine: `optimized`, `official`, `vllm_omni`, `pytorch`, `openvino` (default: `official`)
+- `TTS_MODEL_NAME` - Override default model (optional; not used by the `optimized` backend)
 - `TTS_WARMUP_ON_START` - Warm up backend on startup with 3 staged requests: `true` or `false` (default: `false`)
 - `TTS_MAX_CONCURRENT` - Max concurrent synthesis requests handled per API process (default: `1`)
+- `TTS_CONFIG` - Path to the YAML config file (default: `~/qwen3-tts/config.yaml`, optimized backend only)
 - `ENABLE_VOICE_STUDIO` - Mount Voice Studio at `/voice-studio`: `true` or `false` (default: `false`)
-- `VOICE_LIBRARY_DIR` - Directory for storing voice profiles (default: `./voice_library`)
+- `VOICE_LIBRARY_DIR` - Directory for voice library profiles (default: `./voice_library`)
+- `GPU_KEEPALIVE_INTERVAL` - Seconds between keepalive GPU matmuls; prevents AMD idle downclocking (default: `0` = disabled; recommended: `15` for AMD ROCm)
 
 **Backend Selection:**
 
