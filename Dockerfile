@@ -4,7 +4,7 @@
 # =============================================================================
 # Stage 1: Base image with system dependencies
 # =============================================================================
-ARG BASE_IMAGE=nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 FROM ${BASE_IMAGE} AS base
 
 # Prevent interactive prompts during package installation
@@ -45,7 +45,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 # =============================================================================
 # Stage 2: Builder with CUDA development tools for flash-attn
 # =============================================================================
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS builder
 
 # Install Python and build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -71,12 +71,12 @@ WORKDIR /build
 COPY pyproject.toml ./
 COPY README.md ./
 
-# Install CUDA-enabled PyTorch
+# Install CUDA-enabled PyTorch (cu128 required for Blackwell RTX 50xx GPUs)
 RUN pip install --no-cache-dir \
     torch \
     torchvision \
     torchaudio \
-    --index-url https://download.pytorch.org/whl/cu121
+    --index-url https://download.pytorch.org/whl/cu128
 
 # Install the main package dependencies
 RUN pip install --no-cache-dir \
@@ -156,12 +156,12 @@ WORKDIR /build
 COPY pyproject.toml ./
 COPY README.md ./
 
-# Install CUDA-enabled PyTorch
+# Install CUDA-enabled PyTorch (cu128 required for Blackwell RTX 50xx GPUs)
 RUN pip install --no-cache-dir \
     torch \
     torchvision \
     torchaudio \
-    --index-url https://download.pytorch.org/whl/cu121
+    --index-url https://download.pytorch.org/whl/cu128
 
 # Install vLLM (this may take a while)
 RUN pip install --no-cache-dir vllm>=0.4.0
