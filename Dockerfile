@@ -78,6 +78,9 @@ RUN pip install --no-cache-dir \
     torchaudio \
     --index-url https://download.pytorch.org/whl/cu121
 
+# Verify CUDA is properly compiled into PyTorch (fails fast on wrong wheel)
+RUN python -c 'import torch; assert torch.cuda.is_available(), "CUDA not available - wrong PyTorch wheel installed! Build must run on a native x86 NVIDIA Linux machine, not via cross-compilation."'
+
 # Install the main package dependencies
 RUN pip install --no-cache-dir \
     transformers>=4.40.0 \
@@ -162,6 +165,9 @@ RUN pip install --no-cache-dir \
     torchvision \
     torchaudio \
     --index-url https://download.pytorch.org/whl/cu121
+
+# Verify CUDA is properly compiled into PyTorch (fails fast on wrong wheel)
+RUN python -c 'import torch; assert torch.cuda.is_available(), "CUDA not available - wrong PyTorch wheel installed! Build must run on a native x86 NVIDIA Linux machine, not via cross-compilation."'
 
 # Install vLLM (this may take a while)
 RUN pip install --no-cache-dir vllm>=0.4.0
