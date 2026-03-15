@@ -71,10 +71,11 @@ WORKDIR /build
 COPY pyproject.toml ./
 COPY README.md ./
 
-# Install Python dependencies
+# Install CUDA-enabled PyTorch
 RUN pip install --no-cache-dir \
-    torch>=2.0.0 \
-    torchaudio>=2.0.0 \
+    torch \
+    torchvision \
+    torchaudio \
     --index-url https://download.pytorch.org/whl/cu121
 
 # Install the main package dependencies
@@ -155,10 +156,11 @@ WORKDIR /build
 COPY pyproject.toml ./
 COPY README.md ./
 
-# Install base dependencies first
+# Install CUDA-enabled PyTorch
 RUN pip install --no-cache-dir \
-    torch>=2.0.0 \
-    torchaudio>=2.0.0 \
+    torch \
+    torchvision \
+    torchaudio \
     --index-url https://download.pytorch.org/whl/cu121
 
 # Install vLLM (this may take a while)
