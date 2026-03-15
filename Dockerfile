@@ -105,6 +105,9 @@ RUN pip install --no-cache-dir ninja packaging wheel
 # Install flash-attention 2 for optimized attention (requires CUDA)
 # Force compilation for Ada (8.9), Hopper (9.0), and Blackwell (12.0)
 ENV TORCH_CUDA_ARCH_LIST="8.9;9.0;12.0"
+# Restrict to 1 thread to prevent Out-of-Memory (OOM) crashes on the NAS
+ENV MAX_JOBS=1
+ENV FLASH_ATTENTION_FORCE_BUILD="TRUE"
 RUN pip install --no-cache-dir flash-attn --no-build-isolation
 
 # =============================================================================
@@ -125,9 +128,9 @@ COPY . .
 RUN pip install --no-cache-dir -e .
 
 # Create non-root user for security
-# Add to video/render groups so appuser can access /dev/nvidia* CUDA device files
+# Add to video group so appuser can access /dev/nvidia* CUDA device files
 RUN useradd --create-home --shell /bin/bash appuser \
-    && usermod -aG video,render appuser \
+    && usermod -aG video appuser \
     && mkdir -p /tmp/numba_cache \
     && chown -R appuser:appuser /app /tmp/numba_cache
 USER appuser
@@ -214,9 +217,9 @@ COPY . .
 RUN pip install --no-cache-dir -e ".[vllm]"
 
 # Create non-root user for security
-# Add to video/render groups so appuser can access /dev/nvidia* CUDA device files
+# Add to video group so appuser can access /dev/nvidia* CUDA device files
 RUN useradd --create-home --shell /bin/bash appuser \
-    && usermod -aG video,render appuser \
+    && usermod -aG video appuser \
     && mkdir -p /tmp/numba_cache \
     && chown -R appuser:appuser /app /tmp/numba_cache
 USER appuser
