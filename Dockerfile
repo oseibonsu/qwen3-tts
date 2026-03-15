@@ -103,6 +103,8 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir ninja packaging wheel
 
 # Install flash-attention 2 for optimized attention (requires CUDA)
+# Force compilation for Ada (8.9), Hopper (9.0), and Blackwell (12.0)
+ENV TORCH_CUDA_ARCH_LIST="8.9;9.0;12.0"
 RUN pip install --no-cache-dir flash-attn --no-build-isolation
 
 # =============================================================================
@@ -166,6 +168,8 @@ RUN pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cu128
 
 # Install vLLM (this may take a while)
+# Force compilation for Ada (8.9), Hopper (9.0), and Blackwell (12.0)
+ENV TORCH_CUDA_ARCH_LIST="8.9;9.0;12.0"
 RUN pip install --no-cache-dir vllm>=0.4.0
 
 # Install the main package dependencies
