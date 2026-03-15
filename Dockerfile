@@ -123,7 +123,9 @@ COPY . .
 RUN pip install --no-cache-dir -e .
 
 # Create non-root user for security
+# Add to video/render groups so appuser can access /dev/nvidia* CUDA device files
 RUN useradd --create-home --shell /bin/bash appuser \
+    && usermod -aG video,render appuser \
     && mkdir -p /tmp/numba_cache \
     && chown -R appuser:appuser /app /tmp/numba_cache
 USER appuser
@@ -208,7 +210,9 @@ COPY . .
 RUN pip install --no-cache-dir -e ".[vllm]"
 
 # Create non-root user for security
+# Add to video/render groups so appuser can access /dev/nvidia* CUDA device files
 RUN useradd --create-home --shell /bin/bash appuser \
+    && usermod -aG video,render appuser \
     && mkdir -p /tmp/numba_cache \
     && chown -R appuser:appuser /app /tmp/numba_cache
 USER appuser
