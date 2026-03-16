@@ -4,7 +4,7 @@
 # =============================================================================
 # Stage 1: Base image with system dependencies
 # =============================================================================
-ARG BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+ARG BASE_IMAGE=nvidia/cuda:12.9.0-cudnn-runtime-ubuntu24.04
 FROM ${BASE_IMAGE} AS base
 
 # Prevent interactive prompts during package installation
@@ -39,7 +39,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 # =============================================================================
 # Stage 2: Builder with CUDA development tools for flash-attn
 # =============================================================================
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS builder
+FROM nvidia/cuda:12.9.0-cudnn-devel-ubuntu24.04 AS builder
 
 # Install Python and build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -68,7 +68,7 @@ RUN pip install --no-cache-dir --pre \
     torch \
     torchvision \
     torchaudio \
-    --index-url https://download.pytorch.org/whl/nightly/cu128
+    --index-url https://download.pytorch.org/whl/nightly/cu129
 
 # Install the main package dependencies
 RUN pip install --no-cache-dir \
@@ -160,7 +160,7 @@ RUN pip install --no-cache-dir --pre \
     torch \
     torchvision \
     torchaudio \
-    --index-url https://download.pytorch.org/whl/nightly/cu128
+    --index-url https://download.pytorch.org/whl/nightly/cu129
 
 # Install vLLM (this may take a while)
 # Force compilation for Ada (8.9), Hopper (9.0), and Blackwell (12.0)
