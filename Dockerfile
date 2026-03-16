@@ -4,7 +4,7 @@
 # =============================================================================
 # Stage 1: Base image with system dependencies
 # =============================================================================
-ARG BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 FROM ${BASE_IMAGE} AS base
 
 # Prevent interactive prompts during package installation
@@ -18,22 +18,16 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
 
-# Install system dependencies
+# Install Python environment and audio dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 \
-    python3.11-venv \
-    python3.11-dev \
-    python3-pip \
-    build-essential \
-    git \
-    curl \
+    python3 \
+    python3-venv \
+    python3-dev \
     ffmpeg \
     libsndfile1 \
     libsox-dev \
     sox \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
-    && ln -sf /usr/bin/python3 /usr/bin/python
+    && rm -rf /var/lib/apt/lists/*
 
 # Set up Python virtual environment
 RUN python3 -m venv /opt/venv
@@ -45,20 +39,18 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 # =============================================================================
 # Stage 2: Builder with CUDA development tools for flash-attn
 # =============================================================================
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS builder
 
 # Install Python and build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 \
-    python3.11-venv \
-    python3.11-dev \
+    python3 \
+    python3-venv \
+    python3-dev \
     build-essential \
     git \
     curl \
     ninja-build \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
-    && ln -sf /usr/bin/python3 /usr/bin/python
+    && rm -rf /var/lib/apt/lists/*
 
 # Set up Python virtual environment
 RUN python3 -m venv /opt/venv
@@ -71,12 +63,12 @@ WORKDIR /build
 COPY pyproject.toml ./
 COPY README.md ./
 
-# Install CUDA-enabled PyTorch (cu128 required for Blackwell RTX 50xx GPUs)
-RUN pip install --no-cache-dir \
+# Install CUDA-enabled PyTorch (nightly required for full Blackwell initialization on some hosts)
+RUN pip install --no-cache-dir --pre \
     torch \
     torchvision \
     torchaudio \
-    --index-url https://download.pytorch.org/whl/cu128
+    --index-url https://download.pytorch.org/whl/nightly/cu128
 
 # Install the main package dependencies
 RUN pip install --no-cache-dir \
@@ -163,12 +155,12 @@ WORKDIR /build
 COPY pyproject.toml ./
 COPY README.md ./
 
-# Install CUDA-enabled PyTorch (cu128 required for Blackwell RTX 50xx GPUs)
-RUN pip install --no-cache-dir \
+# Install CUDA-enabled PyTorch (nightly required for full Blackwell initialization on some hosts)
+RUN pip install --no-cache-dir --pre \
     torch \
     torchvision \
     torchaudio \
-    --index-url https://download.pytorch.org/whl/cu128
+    --index-url https://download.pytorch.org/whl/nightly/cu128
 
 # Install vLLM (this may take a while)
 # Force compilation for Ada (8.9), Hopper (9.0), and Blackwell (12.0)
